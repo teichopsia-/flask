@@ -11,18 +11,44 @@
 # the Revised BSD License.
 # Copyright (C) 2015 CERN.
 #
-from __future__ import absolute_import, print_function
+from __future__ import absolute_import
+
 import os
 import sys
+from functools import partial
 
 import click
 import pytest
+from _pytest.monkeypatch import notset
 from click.testing import CliRunner
-from flask import Flask, current_app
 
-from flask.cli import AppGroup, FlaskGroup, NoAppException, ScriptInfo, \
-    find_best_app, locate_app, with_appcontext, prepare_exec_for_file, \
-    find_default_import_path
+from flask import Flask, current_app
+from flask.cli import AppGroup, FlaskGroup, NoAppException, ScriptInfo, dotenv, \
+    find_best_app, get_version, load_dotenv, locate_app, prepare_import, \
+    with_appcontext
+
+cwd = os.getcwd()
+test_path = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), 'test_apps'
+))
+
+
+@pytest.fixture(autouse=True)
+def manage_os_environ(monkeypatch):
+    # can't use monkeypatch.delitem since we don't want to restore a value
+    os.environ.pop('FLASK_APP', None)
+    os.environ.pop('FLASK_DEBUG', None)
+    # use monkeypatch internals to force-delete environ keys
+    monkeypatch._setitem.extend((
+        (os.environ, 'FLASK_APP', notset),
+        (os.environ, 'FLASK_DEBUG', notset),
+        (os.environ, 'FLASK_RUN_FROM_CLI', notset),
+    ))
+
+
+@pytest.fixture
+def runner():
+    return CliRunner()
 
 
 def test_cli_name(test_apps):
@@ -33,72 +59,209 @@ def test_cli_name(test_apps):
 
 def test_find_best_app(test_apps):
     """Test if `find_best_app` behaves as expected with different combinations of input."""
+    script_info = ScriptInfo()
+
     class Module:
         app = Flask('appname')
-    assert find_best_app(Module) == Module.app
+
+    assert find_best_app(script_info, Module) == Module.app
 
     class Module:
         application = Flask('appname')
-    assert find_best_app(Module) == Module.application
+
+    assert find_best_app(script_info, Module) == Module.application
 
     class Module:
         myapp = Flask('appname')
-    assert find_best_app(Module) == Module.myapp
+
+    assert find_best_app(script_info, Module) == Module.myapp
+
+    class Module:
+        @staticmethod
+        def create_app():
+            return Flask('appname')
+
+    assert isinstance(find_best_app(script_info, Module), Flask)
+    assert find_best_app(script_info, Module).name == 'appname'
+
+    class Module:
+        @staticmethod
+        def create_app(foo):
+            return Flask('appname')
+
+    assert isinstance(find_best_app(script_info, Module), Flask)
+    assert find_best_app(script_info, Module).name == 'appname'
+
+    class Module:
+        @staticmethod
+        def create_app(foo=None, script_info=None):
+            return Flask('appname')
+
+    assert isinstance(find_best_app(script_info, Module), Flask)
+    assert find_best_app(script_info, Module).name == 'appname'
+
+    class Module:
+        @staticmethod
+        def make_app():
+            return Flask('appname')
+
+    assert isinstance(find_best_app(script_info, Module), Flask)
+    assert find_best_app(script_info, Module).name == 'appname'
+
+    class Module:
+        myapp = Flask('appname1')
+
+        @staticmethod
+        def create_app():
+            return Flask('appname2')
+
+    assert find_best_app(script_info, Module) == Module.myapp
+
+    class Module:
+        myapp = Flask('appname1')
+
+        @staticmethod
+        def create_app():
+            return Flask('appname2')
+
+    assert find_best_app(script_info, Module) == Module.myapp
 
     class Module:
         pass
-    pytest.raises(NoAppException, find_best_app, Module)
+
+    pytest.raises(NoAppException, find_best_app, script_info, Module)
 
     class Module:
         myapp1 = Flask('appname1')
         myapp2 = Flask('appname2')
-    pytest.raises(NoAppException, find_best_app, Module)
+
+    pytest.raises(NoAppException, find_best_app, script_info, Module)
+
+    class Module:
+        @staticmethod
+        def create_app(foo, bar):
+            return Flask('appname2')
+
+    pytest.raises(NoAppException, find_best_app, script_info, Module)
 
 
-def test_prepare_exec_for_file(test_apps):
-    """Expect the correct path to be set and the correct module name to be returned.
+@pytest.mark.parametrize('value,path,result', (
+    ('test', cwd, 'test'),
+    ('test.py', cwd, 'test'),
+    ('a/test', os.path.join(cwd, 'a'), 'test'),
+    ('test/__init__.py', cwd, 'test'),
+    ('test/__init__', cwd, 'test'),
+    # nested package
+    (
+        os.path.join(test_path, 'cliapp', 'inner1', '__init__'),
+        test_path, 'cliapp.inner1'
+    ),
+    (
+        os.path.join(test_path, 'cliapp', 'inner1', 'inner2'),
+        test_path, 'cliapp.inner1.inner2'
+    ),
+    # dotted name
+    ('test.a.b', cwd, 'test.a.b'),
+    (os.path.join(test_path, 'cliapp.app'), test_path, 'cliapp.app'),
+    # not a Python file, will be caught during import
+    (
+        os.path.join(test_path, 'cliapp', 'message.txt'),
+        test_path, 'cliapp.message.txt'
+    ),
+))
+def test_prepare_import(request, value, path, result):
+    """Expect the correct path to be set and the correct import and app names
+    to be returned.
 
-    :func:`prepare_exec_for_file` has a side effect, where
-    the parent directory of given file is added to `sys.path`.
+    :func:`prepare_exec_for_file` has a side effect where the parent directory
+    of the given import is added to :data:`sys.path`. This is reset after the
+    test runs.
     """
-    realpath = os.path.realpath('/tmp/share/test.py')
-    dirname = os.path.dirname(realpath)
-    assert prepare_exec_for_file('/tmp/share/test.py') == 'test'
-    assert dirname in sys.path
+    original_path = sys.path[:]
 
-    realpath = os.path.realpath('/tmp/share/__init__.py')
-    dirname = os.path.dirname(os.path.dirname(realpath))
-    assert prepare_exec_for_file('/tmp/share/__init__.py') == 'share'
-    assert dirname in sys.path
+    def reset_path():
+        sys.path[:] = original_path
+
+    request.addfinalizer(reset_path)
+
+    assert prepare_import(value) == result
+    assert sys.path[0] == path
+
+
+@pytest.mark.parametrize('iname,aname,result', (
+    ('cliapp.app', None, 'testapp'),
+    ('cliapp.app', 'testapp', 'testapp'),
+    ('cliapp.factory', None, 'app'),
+    ('cliapp.factory', 'create_app', 'app'),
+    ('cliapp.factory', 'create_app()', 'app'),
+    # no script_info
+    ('cliapp.factory', 'create_app2("foo", "bar")', 'app2_foo_bar'),
+    # trailing comma space
+    ('cliapp.factory', 'create_app2("foo", "bar", )', 'app2_foo_bar'),
+    # takes script_info
+    ('cliapp.factory', 'create_app3("foo")', 'app3_foo_spam'),
+    # strip whitespace
+    ('cliapp.factory', ' create_app () ', 'app'),
+))
+def test_locate_app(test_apps, iname, aname, result):
+    info = ScriptInfo()
+    info.data['test'] = 'spam'
+    assert locate_app(info, iname, aname).name == result
+
+
+@pytest.mark.parametrize('iname,aname', (
+    ('notanapp.py', None),
+    ('cliapp/app', None),
+    ('cliapp.app', 'notanapp'),
+    # not enough arguments
+    ('cliapp.factory', 'create_app2("foo")'),
+    # invalid identifier
+    ('cliapp.factory', 'create_app('),
+    # no app returned
+    ('cliapp.factory', 'no_app'),
+    # nested import error
+    ('cliapp.importerrorapp', None),
+    # not a Python file
+    ('cliapp.message.txt', None),
+))
+def test_locate_app_raises(test_apps, iname, aname):
+    info = ScriptInfo()
 
     with pytest.raises(NoAppException):
-        prepare_exec_for_file('/tmp/share/test.txt')
+        locate_app(info, iname, aname)
 
 
-def test_locate_app(test_apps):
-    """Test of locate_app."""
-    assert locate_app("cliapp.app").name == "testapp"
-    assert locate_app("cliapp.app:testapp").name == "testapp"
-    assert locate_app("cliapp.multiapp:app1").name == "app1"
-    pytest.raises(NoAppException, locate_app, "notanpp.py")
-    pytest.raises(NoAppException, locate_app, "cliapp/app")
-    pytest.raises(RuntimeError, locate_app, "cliapp.app:notanapp")
+def test_locate_app_suppress_raise():
+    info = ScriptInfo()
+    app = locate_app(info, 'notanapp.py', None, raise_if_not_found=False)
+    assert app is None
+
+    # only direct import error is suppressed
+    with pytest.raises(NoAppException):
+        locate_app(
+            info, 'cliapp.importerrorapp', None, raise_if_not_found=False
+        )
 
 
-def test_find_default_import_path(test_apps, monkeypatch, tmpdir):
-    """Test of find_default_import_path."""
-    monkeypatch.delitem(os.environ, 'FLASK_APP', raising=False)
-    assert find_default_import_path() == None
-    monkeypatch.setitem(os.environ, 'FLASK_APP', 'notanapp')
-    assert find_default_import_path() == 'notanapp'
-    tmpfile = tmpdir.join('testapp.py')
-    tmpfile.write('')
-    monkeypatch.setitem(os.environ, 'FLASK_APP', str(tmpfile))
-    expect_rv = prepare_exec_for_file(str(tmpfile))
-    assert find_default_import_path() == expect_rv
+def test_get_version(test_apps, capsys):
+    """Test of get_version."""
+    from flask import __version__ as flask_ver
+    from sys import version as py_ver
+
+    class MockCtx(object):
+        resilient_parsing = False
+        color = None
+
+        def exit(self): return
+
+    ctx = MockCtx()
+    get_version(ctx, None, "test")
+    out, err = capsys.readouterr()
+    assert flask_ver in out
+    assert py_ver in out
 
 
-def test_scriptinfo(test_apps):
+def test_scriptinfo(test_apps, monkeypatch):
     """Test of ScriptInfo."""
     obj = ScriptInfo(app_import_path="cliapp.app:testapp")
     assert obj.load_app().name == "testapp"
@@ -112,9 +275,29 @@ def test_scriptinfo(test_apps):
     assert app.name == "createapp"
     assert obj.load_app() == app
 
+    obj = ScriptInfo()
+    pytest.raises(NoAppException, obj.load_app)
 
-def test_with_appcontext():
+    # import app from wsgi.py in current directory
+    monkeypatch.chdir(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), 'test_apps', 'helloworld'
+    )))
+    obj = ScriptInfo()
+    app = obj.load_app()
+    assert app.name == 'hello'
+
+    # import app from app.py in current directory
+    monkeypatch.chdir(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), 'test_apps', 'cliapp'
+    )))
+    obj = ScriptInfo()
+    app = obj.load_app()
+    assert app.name == 'testapp'
+
+
+def test_with_appcontext(runner):
     """Test of with_appcontext."""
+
     @click.command()
     @with_appcontext
     def testcmd():
@@ -122,14 +305,14 @@ def test_with_appcontext():
 
     obj = ScriptInfo(create_app=lambda info: Flask("testapp"))
 
-    runner = CliRunner()
     result = runner.invoke(testcmd, obj=obj)
     assert result.exit_code == 0
     assert result.output == 'testapp\n'
 
 
-def test_appgroup():
+def test_appgroup(runner):
     """Test of with_appcontext."""
+
     @click.group(cls=AppGroup)
     def cli():
         pass
@@ -148,7 +331,6 @@ def test_appgroup():
 
     obj = ScriptInfo(create_app=lambda info: Flask("testappgroup"))
 
-    runner = CliRunner()
     result = runner.invoke(cli, ['test'], obj=obj)
     assert result.exit_code == 0
     assert result.output == 'testappgroup\n'
@@ -158,8 +340,9 @@ def test_appgroup():
     assert result.output == 'testappgroup\n'
 
 
-def test_flaskgroup():
+def test_flaskgroup(runner):
     """Test FlaskGroup."""
+
     def create_app(info):
         return Flask("flaskgroup")
 
@@ -171,7 +354,124 @@ def test_flaskgroup():
     def test():
         click.echo(current_app.name)
 
-    runner = CliRunner()
     result = runner.invoke(cli, ['test'])
     assert result.exit_code == 0
     assert result.output == 'flaskgroup\n'
+
+
+def test_print_exceptions(runner):
+    """Print the stacktrace if the CLI."""
+
+    def create_app(info):
+        raise Exception("oh no")
+        return Flask("flaskgroup")
+
+    @click.group(cls=FlaskGroup, create_app=create_app)
+    def cli(**params):
+        pass
+
+    result = runner.invoke(cli, ['--help'])
+    assert result.exit_code == 0
+    assert 'Exception: oh no' in result.output
+    assert 'Traceback' in result.output
+
+
+class TestRoutes:
+    @pytest.fixture
+    def invoke(self, runner):
+        def create_app(info):
+            app = Flask(__name__)
+            app.testing = True
+
+            @app.route('/get_post/<int:x>/<int:y>', methods=['GET', 'POST'])
+            def yyy_get_post(x, y):
+                pass
+
+            @app.route('/zzz_post', methods=['POST'])
+            def aaa_post():
+                pass
+
+            return app
+
+        cli = FlaskGroup(create_app=create_app)
+        return partial(runner.invoke, cli)
+
+    def expect_order(self, order, output):
+        # skip the header and match the start of each row
+        for expect, line in zip(order, output.splitlines()[2:]):
+            # do this instead of startswith for nicer pytest output
+            assert line[:len(expect)] == expect
+
+    def test_simple(self, invoke):
+        result = invoke(['routes'])
+        assert result.exit_code == 0
+        self.expect_order(
+            ['aaa_post', 'static', 'yyy_get_post'],
+            result.output
+        )
+
+    def test_sort(self, invoke):
+        default_output = invoke(['routes']).output
+        endpoint_output = invoke(['routes', '-s', 'endpoint']).output
+        assert default_output == endpoint_output
+        self.expect_order(
+            ['static', 'yyy_get_post', 'aaa_post'],
+            invoke(['routes', '-s', 'methods']).output
+        )
+        self.expect_order(
+            ['yyy_get_post', 'static', 'aaa_post'],
+            invoke(['routes', '-s', 'rule']).output
+        )
+        self.expect_order(
+            ['aaa_post', 'yyy_get_post', 'static'],
+            invoke(['routes', '-s', 'match']).output
+        )
+
+    def test_all_methods(self, invoke):
+        output = invoke(['routes']).output
+        assert 'GET, HEAD, OPTIONS, POST' not in output
+        output = invoke(['routes', '--all-methods']).output
+        assert 'GET, HEAD, OPTIONS, POST' in output
+
+
+need_dotenv = pytest.mark.skipif(
+    dotenv is None, reason='dotenv is not installed'
+)
+
+
+@need_dotenv
+def test_load_dotenv(monkeypatch):
+    # can't use monkeypatch.delitem since the keys don't exist yet
+    for item in ('FOO', 'BAR', 'SPAM'):
+        monkeypatch._setitem.append((os.environ, item, notset))
+
+    monkeypatch.setenv('EGGS', '3')
+    monkeypatch.chdir(os.path.join(test_path, 'cliapp', 'inner1'))
+    load_dotenv()
+    assert os.getcwd() == test_path
+    # .flaskenv doesn't overwrite .env
+    assert os.environ['FOO'] == 'env'
+    # set only in .flaskenv
+    assert os.environ['BAR'] == 'bar'
+    # set only in .env
+    assert os.environ['SPAM'] == '1'
+    # set manually, files don't overwrite
+    assert os.environ['EGGS'] == '3'
+
+
+@need_dotenv
+def test_dotenv_path(monkeypatch):
+    for item in ('FOO', 'BAR', 'EGGS'):
+        monkeypatch._setitem.append((os.environ, item, notset))
+
+    cwd = os.getcwd()
+    load_dotenv(os.path.join(test_path, '.flaskenv'))
+    assert os.getcwd() == cwd
+    assert 'FOO' in os.environ
+
+
+def test_dotenv_optional(monkeypatch):
+    monkeypatch.setattr('flask.cli.dotenv', None)
+    monkeypatch.chdir(test_path)
+    load_dotenv()
+    assert 'FOO' not in os.environ

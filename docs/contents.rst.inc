@@ -16,6 +16,7 @@ instructions for web development with Flask.
    templating
    testing
    errorhandling
+   logging
    config
    signals
    views
@@ -59,3 +60,4 @@ Design notes, legal information and changelog are here for the interested.
    upgrading
    changelog
    license
+   contributing
